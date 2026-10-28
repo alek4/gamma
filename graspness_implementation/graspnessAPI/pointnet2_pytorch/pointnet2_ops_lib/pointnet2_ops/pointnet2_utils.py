@@ -10,7 +10,7 @@ import torch.nn as nn
 import warnings
 from torch.autograd import Function
 from typing import *
-import pytorch_utils as pt_utils
+import pointnet2_ops.pytorch_utils as pt_utils
 
 try:
     import pointnet2_ops._ext as _ext
