@@ -81,11 +81,12 @@ def patch_config(cfg: DictConfig) -> DictConfig:
     Internal method only. Modifies a configuration by inferring some missing keys
     and makes sure some keys are present and compatible with each other.
     """
-    # In the single-agent setup use the agent's key from `habitat.simulator.agents`.
-    
-    print("===== cfg =====", cfg)
-    cfg = cfg.rearrange
+    # run.py composes "rearrange/<name>.yaml" through Hydra, which nests the
+    # config under a "rearrange" key; get_config() does not. Unwrap if nested.
+    if "habitat" not in cfg and "rearrange" in cfg:
+        cfg = cfg.rearrange
 
+    # In the single-agent setup use the agent's key from `habitat.simulator.agents`.
     sim_config = cfg.habitat.simulator
     if len(sim_config.agents) == 1:
         with read_write(sim_config):
