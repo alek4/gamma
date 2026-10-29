@@ -535,8 +535,12 @@ class GraspSensor(UsesArticulatedAgentInterface, Sensor): #  articulated_camera 
 
         coordinates_batch, features_batch = ME.utils.sparse_collate([d["coors"] for d in list_data],
                                                                     [d["feats"] for d in list_data])
+        # sparse_collate already returns int coordinates, but sparse_quantize
+        # floors them and torch 1.10 has no CPU floor for ints: quantize as
+        # float (same values) and cast back for ME.SparseTensor.
         coordinates_batch, features_batch, _, quantize2original = ME.utils.sparse_quantize(
-            coordinates_batch, features_batch, return_index=True, return_inverse=True)
+            coordinates_batch.float(), features_batch, return_index=True, return_inverse=True)
+        coordinates_batch = coordinates_batch.int()
         res = {
             "coors": coordinates_batch,
             "feats": features_batch,
