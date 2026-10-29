@@ -25,19 +25,19 @@ Controls (hold the key):
 Window: third-person view | head RGB over arm RGB. The fused grasp poses kept by
 the online fusion module are drawn on the camera images (red = low score,
 green = high score); the target object is the yellow cross.
+
+The window runs in a separate process: initialising pygame/SDL in the same
+process as habitat-sim swaps out habitat-sim's OpenGL context, and its next
+render crashes (GLXMakeCurrent BadAccess with a display, segfault without).
 """
 
 import argparse
+import importlib.util
+import multiprocessing as mp
 import os
 
 import cv2
-import magnum as mn
 import numpy as np
-
-try:
-    import pygame
-except ImportError:
-    pygame = None
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CFG = "rearrange/rearrange_w_grasping.yaml"
@@ -57,8 +57,8 @@ def make_config(args):
 
     config = get_config(args.cfg, args.opts)
     with read_write(config):
-        # Background rendering needs a second GL context in another thread,
-        # which the GLX (display) build of habitat-sim refuses (BadAccess).
+        # Synchronous rendering is enough for viewing and keeps habitat-sim to
+        # a single GL context (concur_render adds one in a background thread).
         config.habitat.simulator.concur_render = False
         agent_config = get_agent_config(sim_config=config.habitat.simulator)
         agent_config.sim_sensors.update(
@@ -91,6 +91,8 @@ def camera_hfovs(config):
 
 def project(points, sim, uuid, hfov_deg, shape):
     """World points -> pixel coords in a pinhole camera (None if behind it)."""
+    import magnum as mn
+
     node = sim._sensors[uuid]._sensor_object.node
     cam_from_world = node.absolute_transformation().inverted()
     h, w = shape[:2]
@@ -139,7 +141,7 @@ def compose(obs, images, lines):
     return frame
 
 
-def read_held_keys():
+def read_held_keys(pygame):
     keys = pygame.key.get_pressed()
     base = np.zeros(3, dtype=np.float32)  # [forward, lateral (+left), turn (+left)]
     if keys[pygame.K_i]:
@@ -176,51 +178,48 @@ def print_state(env, obs):
     )
 
 
-def play(env, hfovs, fps):
-    obs = env.reset()
-    # Start pygame only after Habitat has created its OpenGL contexts: doing it
-    # before makes both fight over the X display (GLXMakeCurrent BadAccess).
-    pygame.init()
-    grip_cmd = -1.0  # GazeGraspAction: >= 0 tries to grasp, < 0 releases
-    total_reward, step = 0.0, 0
-    screen, clock = None, pygame.time.Clock()
+def window_process(conn, fps):
+    """Child process: shows the frames it receives, replies with the input."""
+    import pygame
 
+    pygame.init()
+    screen, clock = None, pygame.time.Clock()
     while True:
-        new_episode = False
+        frame = conn.recv()
+        if frame is None:
+            break
+        if screen is None:
+            screen = pygame.display.set_mode((frame.shape[1], frame.shape[0]))
+            pygame.display.set_caption("GAMMA play")
+        screen.blit(pygame.surfarray.make_surface(frame.transpose(1, 0, 2)), (0, 0))
+        pygame.display.update()
+
+        pressed = set()
         for event in pygame.event.get():
             if event.type == pygame.QUIT or (
                 event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
             ):
-                return
-            if event.type == pygame.KEYDOWN:
+                pressed.add("quit")
+            elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_SPACE:
-                    grip_cmd = -grip_cmd
+                    pressed.add("grip")
                 elif event.key == pygame.K_m:
-                    new_episode = True
+                    pressed.add("new_episode")
                 elif event.key == pygame.K_p:
-                    print_state(env, obs)
+                    pressed.add("print")
+        base, arm = read_held_keys(pygame)
+        conn.send((base, arm, pressed))
+        clock.tick(fps)
+    pygame.quit()
 
-        if new_episode or env.episode_over:
-            print(f"episode over after {step} steps, return {total_reward:+.2f}")
-            obs = env.reset()
-            grip_cmd, total_reward, step = -1.0, 0.0, 0
 
-        base, arm = read_held_keys()
-        obs = env.step(
-            {
-                "action": (ARM_ACTION, BASE_ACTION),
-                "action_args": {
-                    "arm_action": arm,
-                    "grip_action": np.array([grip_cmd], dtype=np.float32),
-                    "base_vel": base,
-                },
-            }
-        )
-        metrics = env.get_metrics()
-        reward = float(metrics.get("pick_reward", 0.0))
-        total_reward += reward
-        step += 1
+def play(env, hfovs, conn):
+    obs = env.reset()
+    grip_cmd = -1.0  # GazeGraspAction: >= 0 tries to grasp, < 0 releases
+    total_reward, reward, step = 0.0, 0.0, 0
+    metrics = env.get_metrics()
 
+    while True:
         counters = np.asarray(obs["grasp_sensor"])[GRASP_NUM]
         images = {k: np.ascontiguousarray(obs[k][..., :3]) for k in VIEW_CAMS}
         draw_overlays(images, env, hfovs)
@@ -236,13 +235,36 @@ def play(env, hfovs, fps):
                 f"success {int(bool(metrics.get('pick_success', False)))}",
             ],
         )
+        conn.send(frame)
+        base, arm, pressed = conn.recv()
 
-        if screen is None:
-            screen = pygame.display.set_mode((frame.shape[1], frame.shape[0]))
-            pygame.display.set_caption("GAMMA play")
-        screen.blit(pygame.surfarray.make_surface(frame.transpose(1, 0, 2)), (0, 0))
-        pygame.display.update()
-        clock.tick(fps)
+        if "quit" in pressed:
+            return
+        if "grip" in pressed:
+            grip_cmd = -grip_cmd
+        if "print" in pressed:
+            print_state(env, obs)
+        if "new_episode" in pressed or env.episode_over:
+            print(f"episode over after {step} steps, return {total_reward:+.2f}")
+            obs = env.reset()
+            grip_cmd, total_reward, reward, step = -1.0, 0.0, 0.0, 0
+            metrics = env.get_metrics()
+            continue
+
+        obs = env.step(
+            {
+                "action": (ARM_ACTION, BASE_ACTION),
+                "action_args": {
+                    "arm_action": arm,
+                    "grip_action": np.array([grip_cmd], dtype=np.float32),
+                    "base_vel": base,
+                },
+            }
+        )
+        metrics = env.get_metrics()
+        reward = float(metrics.get("pick_reward", 0.0))
+        total_reward += reward
+        step += 1
 
 
 def main():
@@ -259,16 +281,28 @@ def main():
         "opts", nargs=argparse.REMAINDER, help="config overrides, e.g. habitat.dataset.split=val"
     )
     args = parser.parse_args()
-    if pygame is None:
+    if importlib.util.find_spec("pygame") is None:
         raise ImportError("Need PyGame: python -m pip install pygame")
+
+    # "spawn" gives the window a fresh interpreter that never loads habitat-sim.
+    ctx = mp.get_context("spawn")
+    conn, child_conn = ctx.Pipe()
+    window = ctx.Process(target=window_process, args=(child_conn, args.fps), daemon=True)
+    window.start()
 
     os.chdir(REPO_ROOT)
     import habitat
 
     config = make_config(args)
-    with habitat.Env(config=config) as env:
-        play(env, camera_hfovs(config), args.fps)
-    pygame.quit()
+    try:
+        with habitat.Env(config=config) as env:
+            play(env, camera_hfovs(config), conn)
+    finally:
+        try:
+            conn.send(None)
+        except (BrokenPipeError, OSError):
+            pass  # window already closed
+        window.join(timeout=5)
 
 
 if __name__ == "__main__":
