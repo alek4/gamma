@@ -175,6 +175,9 @@ def print_state(env, obs):
 
 def play(env, hfovs, fps):
     obs = env.reset()
+    # Start pygame only after Habitat has created its OpenGL contexts: doing it
+    # before makes both fight over the X display (GLXMakeCurrent BadAccess).
+    pygame.init()
     grip_cmd = -1.0  # GazeGraspAction: >= 0 tries to grasp, < 0 releases
     total_reward, step = 0.0, 0
     screen, clock = None, pygame.time.Clock()
@@ -260,7 +263,6 @@ def main():
     import habitat
 
     config = make_config(args)
-    pygame.init()
     with habitat.Env(config=config) as env:
         play(env, camera_hfovs(config), args.fps)
     pygame.quit()
