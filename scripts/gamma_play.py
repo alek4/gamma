@@ -24,7 +24,9 @@ Controls (hold the key):
 
 Window: third-person view | head RGB over arm RGB. The fused grasp poses kept by
 the online fusion module are drawn on the camera images (red = low score,
-green = high score); the target object is the yellow cross.
+green = high score). The yellow cross is the target's start position, which is
+what GraspSensor crops its point cloud around; the cyan circle is where the
+target is now.
 
 The window runs in a separate process: initialising pygame/SDL in the same
 process as habitat-sim swaps out habitat-sim's OpenGL context, and its next
@@ -110,11 +112,19 @@ def project(points, sim, uuid, hfov_deg, shape):
     return pixels
 
 
+def target_positions(env):
+    """Target start position (what GraspSensor uses) and where it is now."""
+    start = np.asarray(env.sim.get_target_objs_start())
+    idxs, _ = env.sim.get_targets()
+    current = np.asarray(env.sim.get_scene_pos())[idxs]
+    return start, current
+
+
 def draw_overlays(images, env, hfovs):
     grasps = env.task.sensor_suite.sensors[
         "grasp_sensor"
     ].fusion_grasp_gltree.all_grasps_array()
-    target = np.asarray(env.sim.get_target_objs_start())
+    target, target_now = target_positions(env)
     max_score = max(grasps[:, 12].max(), 1e-6) if len(grasps) else 1.0
     for uuid, img in images.items():
         for i, px in enumerate(
@@ -126,6 +136,9 @@ def draw_overlays(images, env, hfovs):
         for px in project(target, env.sim, uuid, hfovs[uuid], img.shape):
             if px is not None:
                 cv2.drawMarker(img, px, (255, 255, 0), cv2.MARKER_CROSS, 12, 2)
+        for px in project(target_now, env.sim, uuid, hfovs[uuid], img.shape):
+            if px is not None:
+                cv2.circle(img, px, 7, (0, 255, 255), 2)
 
 
 def compose(obs, images, lines):
@@ -169,7 +182,9 @@ def read_held_keys(pygame):
 def print_state(env, obs):
     agent = env.sim.articulated_agent
     counters = np.asarray(obs["grasp_sensor"])[GRASP_NUM]
+    target, target_now = target_positions(env)
     print(
+        f"target start {np.round(target, 3)}  now {np.round(target_now, 3)}\n"
         f"base pos {np.round(np.asarray(agent.base_pos), 3)}  "
         f"ee pos {np.round(np.asarray(agent.ee_transform().translation), 3)}\n"
         f"arm joints {np.round(np.asarray(agent.arm_joint_pos), 3)}\n"
@@ -223,13 +238,15 @@ def play(env, hfovs, conn):
         counters = np.asarray(obs["grasp_sensor"])[GRASP_NUM]
         images = {k: np.ascontiguousarray(obs[k][..., :3]) for k in VIEW_CAMS}
         draw_overlays(images, env, hfovs)
+        target, target_now = target_positions(env)
         frame = compose(
             obs,
             images,
             [
                 f"ep {env.current_episode.episode_id}  step {step}  "
                 f"r {reward:+.3f}  R {total_reward:+.2f}",
-                f"fused grasps {int(counters[2])}  edges {int(counters[3])}",
+                f"fused grasps {int(counters[2])}  edges {int(counters[3])}  "
+                f"target moved {100 * np.linalg.norm(target_now - target, axis=1).max():.0f} cm",
                 f"gripper {'GRASP' if grip_cmd >= 0 else 'open'}  "
                 f"holding {int(np.asarray(obs['is_holding']).item())}  "
                 f"success {int(bool(metrics.get('pick_success', False)))}",
