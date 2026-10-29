@@ -57,6 +57,9 @@ def make_config(args):
 
     config = get_config(args.cfg, args.opts)
     with read_write(config):
+        # Background rendering needs a second GL context in another thread,
+        # which the GLX (display) build of habitat-sim refuses (BadAccess).
+        config.habitat.simulator.concur_render = False
         agent_config = get_agent_config(sim_config=config.habitat.simulator)
         agent_config.sim_sensors.update(
             {
